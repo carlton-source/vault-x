@@ -196,3 +196,82 @@
         liquidation-trigger-price: liquidation-price,
         position-opened-time: stacks-block-time,
       })
+
+      ;; Update VaultX trader balance
+      (map-set vaultx-trader-accounts tx-sender { stx-deposited: (- trader-deposit margin-required) })
+
+      ;; Increment VaultX position counter
+      (var-set vaultx-position-id-counter new-position-id)
+      (ok new-position-id)
+    )
+  )
+)
+
+;; Close VaultX trading position
+(define-public (vaultx-close-trade (position-id uint))
+  (let ((position (unwrap! (get-vaultx-position position-id) ERR-POSITION-NOT-FOUND)))
+    ;; Verify VaultX position ownership
+    (asserts! (is-eq (get trader position) tx-sender) ERR-NOT-AUTHORIZED)
+
+    ;; Calculate VaultX profit/loss
+    (let (
+        (profit-loss (vaultx-calculate-pnl position))
+        (trader-deposit (get stx-deposited (get-vaultx-trader-balance tx-sender)))
+      )
+      ;; Return VaultX margin + P&L to trader
+      (map-set vaultx-trader-accounts tx-sender { stx-deposited: (+ trader-deposit (+ (get margin-amount position) profit-loss)) })
+
+      ;; Remove VaultX position from registry
+      (map-delete vaultx-trading-positions position-id)
+      (ok true)
+    )
+  )
+)
+
+;; -----------------------------
+;; VaultX Internal Functions
+;; -----------------------------
+
+;; Calculate VaultX position profit/loss
+(define-private (vaultx-calculate-pnl (position {
+  trader: principal,
+  direction: uint,
+  contract-size: uint,
+  entry-market-price: uint,
+  leverage-multiplier: uint,
+  margin-amount: uint,
+  liquidation-trigger-price: uint,
+  position-opened-time: uint,
+}))
+  (let (
+      (current-market-price (var-get vaultx-market-price))
+      (price-movement (if (is-eq (get direction position) VAULTX-DIRECTION-LONG)
+        (- current-market-price (get entry-market-price position))
+        (- (get entry-market-price position) current-market-price)
+      ))
+    )
+    (* price-movement (get contract-size position))
+  )
+)
+
+;; -----------------------------
+;; VaultX Admin Functions
+;; -----------------------------
+
+;; Update VaultX market price (oracle integration in production)
+(define-public (vaultx-update-oracle-price (new-price uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get vaultx-admin)) ERR-NOT-AUTHORIZED)
+    (var-set vaultx-market-price new-price)
+    (ok true)
+  )
+)
+
+;; Transfer VaultX admin privileges
+(define-public (vaultx-transfer-admin (new-admin principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get vaultx-admin)) ERR-NOT-AUTHORIZED)
+    (var-set vaultx-admin new-admin)
+    (ok true)
+  )
+)
