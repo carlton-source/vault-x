@@ -149,3 +149,50 @@
     (ok (map-set vaultx-trader-accounts tx-sender { stx-deposited: (+ current-deposit amount) }))
   )
 )
+
+;; Withdraw funds from VaultX trader account
+(define-public (vaultx-withdraw-margin (amount uint))
+  (let ((current-deposit (get stx-deposited (get-vaultx-trader-balance tx-sender))))
+    (asserts! (>= current-deposit amount) ERR-INSUFFICIENT-FUNDS)
+    (ok (map-set vaultx-trader-accounts tx-sender { stx-deposited: (- current-deposit amount) }))
+  )
+)
+
+;; Open new VaultX trading position
+(define-public (vaultx-open-trade
+    (direction uint)
+    (size uint)
+    (leverage uint)
+  )
+  (let (
+      (margin-required (/ (* size (var-get vaultx-market-price)) leverage))
+      (trader-deposit (get stx-deposited (get-vaultx-trader-balance tx-sender)))
+      (new-position-id (+ (var-get vaultx-position-id-counter) u1))
+      (market-entry-price (var-get vaultx-market-price))
+    )
+    ;; VaultX position validation checks
+    (asserts!
+      (or
+        (is-eq direction VAULTX-DIRECTION-LONG)
+        (is-eq direction VAULTX-DIRECTION-SHORT)
+      )
+      ERR-INVALID-TRADE-PARAMS
+    )
+    (asserts! (>= trader-deposit margin-required) ERR-INSUFFICIENT-MARGIN)
+
+    ;; Calculate VaultX liquidation trigger
+    (let ((liquidation-price (unwrap!
+        (calculate-vaultx-liquidation-price market-entry-price direction leverage)
+        ERR-INVALID-TRADE-PARAMS
+      )))
+      ;; Register new VaultX position
+      (map-set vaultx-trading-positions new-position-id {
+        trader: tx-sender,
+        direction: direction,
+        contract-size: size,
+        entry-market-price: market-entry-price,
+        leverage-multiplier: leverage,
+        margin-amount: margin-required,
+        liquidation-trigger-price: liquidation-price,
+        position-opened-time: stacks-block-time,
+      })
