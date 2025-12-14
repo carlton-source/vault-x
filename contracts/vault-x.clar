@@ -101,3 +101,51 @@
     )
   )
 )
+
+;; Get VaultX position analytics including duration (Clarity 4 feature)
+(define-read-only (get-vaultx-position-analytics (position-id uint))
+  (match (get-vaultx-position position-id)
+    position (let ((duration (- stacks-block-time (get position-opened-time position))))
+      (ok {
+        trader-address: (unwrap-panic (to-ascii? (get trader position))),
+        direction-label: (unwrap-panic (get-vaultx-direction-label (get direction position))),
+        position-duration: duration,
+      })
+    )
+    (err "VaultX position not found")
+  )
+)
+
+;; Check if VaultX position faces liquidation risk (Clarity 4 feature)
+(define-read-only (is-vaultx-position-at-risk (position-id uint))
+  (match (get-vaultx-position position-id)
+    position (let (
+        (current-market-price (var-get vaultx-market-price))
+        (risk-detected (if (is-eq (get direction position) VAULTX-DIRECTION-LONG)
+          (<= current-market-price
+            (/ (* (get liquidation-trigger-price position) u105) u100)
+          )
+          (>= current-market-price
+            (/ (* (get liquidation-trigger-price position) u95) u100)
+          )
+        ))
+      )
+      (ok {
+        liquidation-risk: risk-detected,
+        risk-status-text: (unwrap-panic (to-ascii? risk-detected)),
+      })
+    )
+    (err "VaultX position not found")
+  )
+)
+
+;; -----------------------------
+;; VaultX Public Trading Functions
+;; -----------------------------
+
+;; Deposit funds into VaultX trader account
+(define-public (vaultx-deposit-margin (amount uint))
+  (let ((current-deposit (get stx-deposited (get-vaultx-trader-balance tx-sender))))
+    (ok (map-set vaultx-trader-accounts tx-sender { stx-deposited: (+ current-deposit amount) }))
+  )
+)
