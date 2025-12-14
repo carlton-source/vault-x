@@ -16,6 +16,16 @@
 (define-constant ERR-POSITION-NOT-FOUND (err u103))
 ;; VaultX margin requirement errors
 (define-constant ERR-INSUFFICIENT-MARGIN (err u104))
+;; VaultX contract paused error
+(define-constant ERR-CONTRACT-PAUSED (err u105))
+;; VaultX position size limit error
+(define-constant ERR-POSITION-TOO-LARGE (err u106))
+;; VaultX liquidation not required error
+(define-constant ERR-NOT-LIQUIDATABLE (err u107))
+;; VaultX oracle price stale error
+(define-constant ERR-STALE-PRICE (err u108))
+;; VaultX transfer failed error
+(define-constant ERR-TRANSFER-FAILED (err u109))
 
 ;; VaultX minimum margin ratio requirement (150%)
 (define-constant VAULTX-MIN-MARGIN-RATIO u150)
@@ -23,6 +33,13 @@
 ;; VaultX position direction constants
 (define-constant VAULTX-DIRECTION-LONG u1)
 (define-constant VAULTX-DIRECTION-SHORT u2)
+
+;; VaultX protocol limits
+(define-constant VAULTX-MAX-LEVERAGE u10)
+(define-constant VAULTX-MAX-POSITION-SIZE u1000000000000) ;; 1M STX in microstacks
+(define-constant VAULTX-ORACLE-STALE-THRESHOLD u3600) ;; 1 hour in seconds
+(define-constant VAULTX-LIQUIDATION-FEE-BPS u500) ;; 5% liquidation fee
+(define-constant VAULTX-PROTOCOL-FEE-BPS u10) ;; 0.1% protocol fee
 
 ;; -----------------------------
 ;; VaultX Data Storage
@@ -46,6 +63,7 @@
     margin-amount: uint,
     liquidation-trigger-price: uint,
     position-opened-time: uint,
+    is-liquidated: bool,
   }
 )
 
@@ -57,6 +75,15 @@
 
 ;; VaultX market price feed (production would use oracle)
 (define-data-var vaultx-market-price uint u0)
+
+;; VaultX oracle last update timestamp
+(define-data-var vaultx-price-updated-at uint u0)
+
+;; VaultX protocol paused state
+(define-data-var vaultx-paused bool false)
+
+;; VaultX protocol treasury for fees
+(define-data-var vaultx-treasury principal tx-sender)
 
 ;; -----------------------------
 ;; VaultX Read-Only Query Functions
@@ -146,6 +173,10 @@
 ;; Deposit funds into VaultX trader account
 (define-public (vaultx-deposit-margin (amount uint))
   (let ((current-deposit (get stx-deposited (get-vaultx-trader-balance tx-sender))))
+    (asserts! (not (var-get vaultx-paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (> amount u0) ERR-INVALID-TRADE-PARAMS)
+    ;; Transfer STX from user to contract
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
     (ok (map-set vaultx-trader-accounts tx-sender { stx-deposited: (+ current-deposit amount) }))
   )
 )
@@ -153,7 +184,11 @@
 ;; Withdraw funds from VaultX trader account
 (define-public (vaultx-withdraw-margin (amount uint))
   (let ((current-deposit (get stx-deposited (get-vaultx-trader-balance tx-sender))))
+    (asserts! (not (var-get vaultx-paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (> amount u0) ERR-INVALID-TRADE-PARAMS)
     (asserts! (>= current-deposit amount) ERR-INSUFFICIENT-FUNDS)
+    ;; Transfer STX from contract to user
+    (try! (as-contract (stx-transfer? amount tx-sender (unwrap! (principal-of? tx-sender) ERR-TRANSFER-FAILED))))
     (ok (map-set vaultx-trader-accounts tx-sender { stx-deposited: (- current-deposit amount) }))
   )
 )
@@ -165,11 +200,18 @@
     (leverage uint)
   )
   (let (
-      (margin-required (/ (* size (var-get vaultx-market-price)) leverage))
+      (market-entry-price (var-get vaultx-market-price))
+      (margin-required (/ (* size market-entry-price) leverage))
+      (protocol-fee (/ (* margin-required VAULTX-PROTOCOL-FEE-BPS) u10000))
       (trader-deposit (get stx-deposited (get-vaultx-trader-balance tx-sender)))
       (new-position-id (+ (var-get vaultx-position-id-counter) u1))
-      (market-entry-price (var-get vaultx-market-price))
+      (price-age (- stacks-block-time (var-get vaultx-price-updated-at)))
     )
+    ;; VaultX protocol safety checks
+    (asserts! (not (var-get vaultx-paused)) ERR-CONTRACT-PAUSED)
+    (asserts! (<= price-age VAULTX-ORACLE-STALE-THRESHOLD) ERR-STALE-PRICE)
+    (asserts! (> market-entry-price u0) ERR-INVALID-TRADE-PARAMS)
+    
     ;; VaultX position validation checks
     (asserts!
       (or
@@ -178,7 +220,9 @@
       )
       ERR-INVALID-TRADE-PARAMS
     )
-    (asserts! (>= trader-deposit margin-required) ERR-INSUFFICIENT-MARGIN)
+    (asserts! (<= leverage VAULTX-MAX-LEVERAGE) ERR-INVALID-TRADE-PARAMS)
+    (asserts! (<= size VAULTX-MAX-POSITION-SIZE) ERR-POSITION-TOO-LARGE)
+    (asserts! (>= trader-deposit (+ margin-required protocol-fee)) ERR-INSUFFICIENT-MARGIN)
 
     ;; Calculate VaultX liquidation trigger
     (let ((liquidation-price (unwrap!
@@ -195,10 +239,14 @@
         margin-amount: margin-required,
         liquidation-trigger-price: liquidation-price,
         position-opened-time: stacks-block-time,
+        is-liquidated: false,
       })
 
       ;; Update VaultX trader balance
-      (map-set vaultx-trader-accounts tx-sender { stx-deposited: (- trader-deposit margin-required) })
+      (map-set vaultx-trader-accounts tx-sender { stx-deposited: (- trader-deposit (+ margin-required protocol-fee)) })
+      
+      ;; Transfer protocol fee to treasury
+      (try! (as-contract (stx-transfer? protocol-fee tx-sender (var-get vaultx-treasury))))
 
       ;; Increment VaultX position counter
       (var-set vaultx-position-id-counter new-position-id)
@@ -210,16 +258,34 @@
 ;; Close VaultX trading position
 (define-public (vaultx-close-trade (position-id uint))
   (let ((position (unwrap! (get-vaultx-position position-id) ERR-POSITION-NOT-FOUND)))
-    ;; Verify VaultX position ownership
+    ;; Verify VaultX position ownership and status
     (asserts! (is-eq (get trader position) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (not (get is-liquidated position)) ERR-NOT-AUTHORIZED)
+    (asserts! (not (var-get vaultx-paused)) ERR-CONTRACT-PAUSED)
 
     ;; Calculate VaultX profit/loss
     (let (
         (profit-loss (vaultx-calculate-pnl position))
         (trader-deposit (get stx-deposited (get-vaultx-trader-balance tx-sender)))
+        (margin-amount (get margin-amount position))
+        (protocol-fee (/ (* margin-amount VAULTX-PROTOCOL-FEE-BPS) u10000))
+        ;; Calculate final amount (margin + PnL - fee), ensuring non-negative
+        (final-amount (if (>= profit-loss (to-int u0))
+          (- (+ margin-amount (to-uint profit-loss)) protocol-fee)
+          (if (>= margin-amount (+ (to-uint (- profit-loss)) protocol-fee))
+            (- margin-amount (+ (to-uint (- profit-loss)) protocol-fee))
+            u0
+          )
+        ))
       )
+      ;; Transfer protocol fee if trader has profit or sufficient margin
+      (if (> protocol-fee u0)
+        (try! (as-contract (stx-transfer? protocol-fee tx-sender (var-get vaultx-treasury))))
+        true
+      )
+      
       ;; Return VaultX margin + P&L to trader
-      (map-set vaultx-trader-accounts tx-sender { stx-deposited: (+ trader-deposit (+ (get margin-amount position) profit-loss)) })
+      (map-set vaultx-trader-accounts tx-sender { stx-deposited: (+ trader-deposit final-amount) })
 
       ;; Remove VaultX position from registry
       (map-delete vaultx-trading-positions position-id)
@@ -232,7 +298,7 @@
 ;; VaultX Internal Functions
 ;; -----------------------------
 
-;; Calculate VaultX position profit/loss
+;; Calculate VaultX position profit/loss (returns int to handle negative values)
 (define-private (vaultx-calculate-pnl (position {
   trader: principal,
   direction: uint,
@@ -242,15 +308,17 @@
   margin-amount: uint,
   liquidation-trigger-price: uint,
   position-opened-time: uint,
+  is-liquidated: bool,
 }))
   (let (
       (current-market-price (var-get vaultx-market-price))
       (price-movement (if (is-eq (get direction position) VAULTX-DIRECTION-LONG)
-        (- current-market-price (get entry-market-price position))
-        (- (get entry-market-price position) current-market-price)
+        (- (to-int current-market-price) (to-int (get entry-market-price position)))
+        (- (to-int (get entry-market-price position)) (to-int current-market-price))
       ))
+      (contract-size-int (to-int (get contract-size position)))
     )
-    (* price-movement (get contract-size position))
+    (* price-movement contract-size-int)
   )
 )
 
@@ -258,11 +326,50 @@
 ;; VaultX Admin Functions
 ;; -----------------------------
 
+;; Liquidate VaultX position at risk
+(define-public (vaultx-liquidate-position (position-id uint))
+  (let ((position (unwrap! (get-vaultx-position position-id) ERR-POSITION-NOT-FOUND)))
+    ;; Verify position not already liquidated
+    (asserts! (not (get is-liquidated position)) ERR-NOT-AUTHORIZED)
+    
+    ;; Check if position is liquidatable
+    (let (
+        (current-market-price (var-get vaultx-market-price))
+        (is-liquidatable (if (is-eq (get direction position) VAULTX-DIRECTION-LONG)
+          (<= current-market-price (get liquidation-trigger-price position))
+          (>= current-market-price (get liquidation-trigger-price position))
+        ))
+      )
+      (asserts! is-liquidatable ERR-NOT-LIQUIDATABLE)
+      
+      ;; Calculate liquidation fee for liquidator
+      (let (
+          (liquidation-fee (/ (* (get margin-amount position) VAULTX-LIQUIDATION-FEE-BPS) u10000))
+          (remaining-margin (- (get margin-amount position) liquidation-fee))
+          (trader-deposit (get stx-deposited (get-vaultx-trader-balance (get trader position))))
+        )
+        ;; Mark position as liquidated
+        (map-set vaultx-trading-positions position-id (merge position { is-liquidated: true }))
+        
+        ;; Transfer liquidation fee to liquidator
+        (try! (as-contract (stx-transfer? liquidation-fee tx-sender tx-sender)))
+        
+        ;; Return remaining margin to trader
+        (map-set vaultx-trader-accounts (get trader position) { stx-deposited: (+ trader-deposit remaining-margin) })
+        
+        (ok true)
+      )
+    )
+  )
+)
+
 ;; Update VaultX market price (oracle integration in production)
 (define-public (vaultx-update-oracle-price (new-price uint))
   (begin
     (asserts! (is-eq tx-sender (var-get vaultx-admin)) ERR-NOT-AUTHORIZED)
+    (asserts! (> new-price u0) ERR-INVALID-TRADE-PARAMS)
     (var-set vaultx-market-price new-price)
+    (var-set vaultx-price-updated-at stacks-block-time)
     (ok true)
   )
 )
@@ -274,4 +381,34 @@
     (var-set vaultx-admin new-admin)
     (ok true)
   )
+)
+
+;; Pause VaultX protocol (emergency only)
+(define-public (vaultx-set-paused (paused bool))
+  (begin
+    (asserts! (is-eq tx-sender (var-get vaultx-admin)) ERR-NOT-AUTHORIZED)
+    (var-set vaultx-paused paused)
+    (ok true)
+  )
+)
+
+;; Update VaultX treasury address
+(define-public (vaultx-set-treasury (new-treasury principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get vaultx-admin)) ERR-NOT-AUTHORIZED)
+    (var-set vaultx-treasury new-treasury)
+    (ok true)
+  )
+)
+
+;; Get VaultX contract status
+(define-read-only (get-vaultx-status)
+  (ok {
+    paused: (var-get vaultx-paused),
+    admin: (var-get vaultx-admin),
+    treasury: (var-get vaultx-treasury),
+    market-price: (var-get vaultx-market-price),
+    price-updated-at: (var-get vaultx-price-updated-at),
+    total-positions: (var-get vaultx-position-id-counter),
+  })
 )
