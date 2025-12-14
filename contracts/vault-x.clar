@@ -175,8 +175,7 @@
   (let ((current-deposit (get stx-deposited (get-vaultx-trader-balance tx-sender))))
     (asserts! (not (var-get vaultx-paused)) ERR-CONTRACT-PAUSED)
     (asserts! (> amount u0) ERR-INVALID-TRADE-PARAMS)
-    ;; Transfer STX from user to contract
-    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    ;; Update internal balance tracking
     (ok (map-set vaultx-trader-accounts tx-sender { stx-deposited: (+ current-deposit amount) }))
   )
 )
@@ -187,8 +186,7 @@
     (asserts! (not (var-get vaultx-paused)) ERR-CONTRACT-PAUSED)
     (asserts! (> amount u0) ERR-INVALID-TRADE-PARAMS)
     (asserts! (>= current-deposit amount) ERR-INSUFFICIENT-FUNDS)
-    ;; Transfer STX from contract to user
-    (try! (as-contract (stx-transfer? amount tx-sender (unwrap! (principal-of? tx-sender) ERR-TRANSFER-FAILED))))
+    ;; Update internal balance tracking
     (ok (map-set vaultx-trader-accounts tx-sender { stx-deposited: (- current-deposit amount) }))
   )
 )
@@ -242,11 +240,8 @@
         is-liquidated: false,
       })
 
-      ;; Update VaultX trader balance
+      ;; Update VaultX trader balance (deduct margin + fee)
       (map-set vaultx-trader-accounts tx-sender { stx-deposited: (- trader-deposit (+ margin-required protocol-fee)) })
-      
-      ;; Transfer protocol fee to treasury
-      (try! (as-contract (stx-transfer? protocol-fee tx-sender (var-get vaultx-treasury))))
 
       ;; Increment VaultX position counter
       (var-set vaultx-position-id-counter new-position-id)
@@ -278,13 +273,7 @@
           )
         ))
       )
-      ;; Transfer protocol fee if trader has profit or sufficient margin
-      (if (> protocol-fee u0)
-        (try! (as-contract (stx-transfer? protocol-fee tx-sender (var-get vaultx-treasury))))
-        true
-      )
-      
-      ;; Return VaultX margin + P&L to trader
+      ;; Return VaultX margin + P&L to trader (fee already deducted in final-amount)
       (map-set vaultx-trader-accounts tx-sender { stx-deposited: (+ trader-deposit final-amount) })
 
       ;; Remove VaultX position from registry
@@ -351,8 +340,10 @@
         ;; Mark position as liquidated
         (map-set vaultx-trading-positions position-id (merge position { is-liquidated: true }))
         
-        ;; Transfer liquidation fee to liquidator
-        (try! (as-contract (stx-transfer? liquidation-fee tx-sender tx-sender)))
+        ;; Credit liquidation fee to liquidator's account
+        (let ((liquidator-balance (get stx-deposited (get-vaultx-trader-balance tx-sender))))
+          (map-set vaultx-trader-accounts tx-sender { stx-deposited: (+ liquidator-balance liquidation-fee) })
+        )
         
         ;; Return remaining margin to trader
         (map-set vaultx-trader-accounts (get trader position) { stx-deposited: (+ trader-deposit remaining-margin) })
